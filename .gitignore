@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+
+# Local secrets / config
+.env
+
+# Real lecture audio and generated transcripts are private - keep the folders,
+# drop their contents.
+/samples/*
+!/samples/.gitkeep
+/outputs/*
+!/outputs/.gitkeep
+/uploads/*
+!/uploads/.gitkeep

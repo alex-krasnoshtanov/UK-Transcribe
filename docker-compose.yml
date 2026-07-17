@@ -1,0 +1,49 @@
+# Single deployable: the web UI service. This is the one and only stack to run
+# in Portainer. First startup downloads the model, so give it a minute (the
+# healthcheck's start_period allows for it) before it reports healthy.
+#
+# GPU selection: the container is given ALL visible GPUs and the app picks the
+# one with the most free memory at startup (see app/transcriber.py). This is the
+# polite choice on a shared rack - it does not exclusively lock the cards, it
+# just runs one ~3 GB model on the emptiest one. To restrict which cards are
+# candidates, set NVIDIA_VISIBLE_DEVICES (e.g. "2,5") in .env.
+services:
+  uk-transcribe:
+    image: ${IMAGE:-ghcr.io/gfgf96/uk-transcribe:latest}
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+      HF_TOKEN: ${HF_TOKEN:-}
+      # Which GPUs the container may see (and thus choose the emptiest from).
+      # "all" by default; also the Swarm-friendly way to pin if the deploy
+      # reservation below is ignored by a Swarm endpoint.
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    volumes:
+      - ./outputs:/app/outputs
+      - uploads:/app/uploads
+      # Persist model weights so a redeploy does not re-download multiple GB.
+      - hf-cache:/root/.cache/huggingface
+    restart: unless-stopped
+    # Healthy only once /health reports the model is loaded. urlopen raises on
+    # the 503 returned while loading, so the check stays "unhealthy" until ready.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Generous, because the very first boot downloads the model weights.
+      start_period: 600s
+    deploy:
+      restart_policy:
+        condition: any
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  uploads:
+  hf-cache:

@@ -1,0 +1,14 @@
+# Core inference engine (CTranslate2 backend). Pulls in ctranslate2, PyAV
+# (bundles FFmpeg, so decoding needs no system ffmpeg), onnxruntime (the VAD
+# filter uses it) and huggingface-hub automatically.
+faster-whisper>=1.1.0
+
+# NVML bindings, used only to pick the GPU with the most free memory at startup.
+# Pure-Python ctypes bindings; harmless on CPU-only hosts (never initialised
+# there). Provides `import pynvml`.
+nvidia-ml-py>=12.0.0
+
+# Web UI. One image serves the whole product, so these live alongside the core.
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
