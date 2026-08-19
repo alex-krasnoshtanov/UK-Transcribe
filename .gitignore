@@ -17,6 +17,12 @@ wheels/
 # drop their contents.
 /samples/*
 !/samples/.gitkeep
+/raw_video/*
+!/raw_video/.gitkeep
+/raw_videos/*
+!/raw_videos/.gitkeep
+/ready_audios/*
+!/ready_audios/.gitkeep
 /outputs/*
 !/outputs/.gitkeep
 /uploads/*

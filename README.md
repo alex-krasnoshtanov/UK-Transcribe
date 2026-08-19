@@ -17,6 +17,7 @@ app/transcriber.py      shared core: device selection, model load, decoding
 app/server.py           FastAPI: /upload, /status/{id}, /download/{id}, /health
 app/static/index.html   single-page UI with a live progress bar
 main.py                 thin CLI over the same core (debug/dev only)
+scripts/                small utility scripts, including audio extraction
 requirements.txt        runtime deps for the Docker image
 pyproject.toml          uv project (core + optional `app` extra + `dev` group)
 Dockerfile              CUDA 12 + cuDNN 9 image; runs the web UI by default
@@ -102,6 +103,10 @@ cards. The choice is made once at startup and held for the process lifetime.
   so it reflects real decoding position, not a timer.
 - **Download name**: `<original-name>_transcribed.txt` (change `DOWNLOAD_SUFFIX`
   in `app/server.py` to rename the convention).
+- **Batch audio extraction**: `python scripts/extract_audio_from_videos.py`
+   converts videos from `raw_videos/` into mono 16 kHz WAV files in
+   `ready_audios/`, named `<video-stem>_audio.wav`, and skips files that already
+   exist.
 - **Concurrency**: one model instance, one lock. A second upload is queued
   (shown as "pending") until the first finishes - correct, not concurrent.
 - **HF_TOKEN** also speeds up the large `large-v3` download.
