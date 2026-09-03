@@ -9,7 +9,7 @@
 # candidates, set NVIDIA_VISIBLE_DEVICES (e.g. "2,5") in .env.
 services:
   uk-transcribe:
-    image: ${IMAGE:-ghcr.io/gfgf96/uk-transcribe:latest}
+    image: ${IMAGE:-ghcr.io/alex-krasnoshtanov/uk-transcribe:latest}
     ports:
       - "${PORT:-8000}:8000"
     environment:

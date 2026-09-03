@@ -51,8 +51,8 @@ uv run python main.py samples/sample_uk.wav --model small
 ## Build the image
 
 ```bash
-docker build -t ghcr.io/gfgf96/uk-transcribe:latest .
-docker push ghcr.io/gfgf96/uk-transcribe:latest
+docker build -t ghcr.io/alex-krasnoshtanov/uk-transcribe:latest .
+docker push ghcr.io/alex-krasnoshtanov/uk-transcribe:latest
 ```
 
 Build on a machine with Docker and push to a registry the Portainer host can
