@@ -1,0 +1,105 @@
+# UK-Transcribe on the university Portainer, compose stack "ukt" in the
+# "Student apps (cluster)" environment (endpoint 16).
+#
+# That environment is Portainer's d2k: a Docker API over a shared Kubernetes
+# cluster (namespace "apps"). What that means for this file:
+#   - created through the Portainer API as a compose stack (deploy/ukt.sh), never
+#     through "Add stack" in the UI, which makes a Swarm stack: no GPU, no health
+#   - GPU memory, not a GPU: BUAS_GPU_MEMORY (MiB) gets a slice of one card. A
+#     reservation under deploy: would take a whole 48-96 GB card.
+#   - no bind mounts, no builds: public GHCR images and external volumes only
+#   - published ports only in 30000-32699; every node answers on them
+#   - restart: unless-stopped (a run-once container is a bare pod, refused)
+#   - healthcheck: here becomes the readiness probe (d2k ignores the image's)
+#
+# Don't edit this in Portainer; change it in git and run deploy/ukt.sh deploy.
+#
+# Variables (set by deploy/ukt.sh):
+#   API_IMAGE  ghcr.io/alex-krasnoshtanov/uk-transcribe:sha-<short>
+#   WEB_IMAGE  ghcr.io/alex-krasnoshtanov/uk-transcribe-web:sha-<short>
+#   WEB_PORT   default 30500
+
+services:
+  ukt-api:
+    image: ${API_IMAGE:?set by deploy/ukt.sh}
+    user: "10001:10001"
+    # Not published: only the dashboard talks to it, as http://ukt-api:8000.
+    # Service names are DNS names shared with every team in the namespace: prefixed.
+    environment:
+      WHISPER_MODEL: large-v3
+      # auto: float16 on the GPU (best quality), int8 if it falls back to the CPU.
+      COMPUTE_TYPE: auto
+      BEAM_SIZE: "5"
+      VAD: "1"
+      # auto: the card if it has MIN_FREE_MIB free, else the CPU (int8, slow).
+      # The card is shared with work outside the cluster, so free memory varies.
+      DEVICE: auto
+      MIN_FREE_MIB: "5000"
+      # The cluster's scheduler reads this: a 6 GiB slice of one card (MiB).
+      # large-v3 fp16 with beam 5 peaks around 4-5 GiB; tune after measuring
+      # (deploy/README.md, "Sizing the GPU slice").
+      BUAS_GPU_MEMORY: "6144"
+      MAX_UPLOAD_MB: "2048"
+      MAX_QUEUE: "50"
+      AUDIO_RETENTION_DAYS: "7"
+      TRANSCRIPT_RETENTION_DAYS: "0"
+      CPU_THREADS: "4"
+      # nproc shows the node's 256 cores whatever the limit: cap library threads.
+      OMP_NUM_THREADS: "4"
+      OPENBLAS_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+    volumes:
+      - ukt_data:/data
+      - ukt_models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=8)"]
+      interval: 15s
+      timeout: 10s
+      # The first start downloads ~3 GB of weights into ukt-models.
+      start_period: 900s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  ukt-web:
+    image: ${WEB_IMAGE:?set by deploy/ukt.sh}
+    user: "10002:10002"
+    environment:
+      API_URL: http://ukt-api:8000
+      NODE_OPTIONS: --max-old-space-size=256
+    ports:
+      - "${WEB_PORT:-30500}:8000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ukt_data:
+    external: true
+    name: ukt-data
+  ukt_models:
+    external: true
+    name: ukt-models

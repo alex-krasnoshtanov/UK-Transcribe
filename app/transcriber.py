@@ -1,143 +1,157 @@
-"""Transcription core shared by the web UI and the CLI.
+"""Transcription core shared by the API worker and the CLI.
 
-One implementation of device selection, model loading and decoding, imported by
-both app/server.py (the primary, web entry point) and main.py (a thin CLI kept
-for local/headless debugging). Keeping the core here - rather than inside
-main.py as before - means the deployable product (the UI) no longer imports
-from a top-level script, which is the cleaner dependency direction.
+`WhisperEngine` picks the device (app/gpu.py), loads the faster-whisper model
+once, and streams timestamped segments back through a callback, so the worker
+can store each one as it arrives (live transcript, real progress).
+
+Ukrainian is forced: Whisper's auto-detect regularly mistakes accented or noisy
+Ukrainian for Russian, so detection is never trusted.
 """
 
 from __future__ import annotations
 
-import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
 
-import ctranslate2
-from faster_whisper import WhisperModel
+from app import gpu
+from app.config import Settings
 
-# Ukrainian is forced everywhere. Whisper's auto-detect regularly misclassifies
-# Ukrainian as Russian on accented/noisy audio, so it is never trusted - a hard
-# project requirement, not a tunable.
 LANGUAGE = "uk"
 
-# Model id, overridable per deployment via WHISPER_MODEL. large-v3 is the broad
-# 99-language baseline; the Ukrainian fine-tune can be swapped in without a
-# rebuild.
-DEFAULT_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 
-# Progress callback receives a float in [0, 1]. Optional so the CLI can pass a
-# stderr printer, the server can update job state, and callers who do not care
-# can pass nothing.
-ProgressCallback = Callable[[float], None]
+@dataclass(frozen=True)
+class Segment:
+    start: float
+    end: float
+    text: str
 
 
-def _gpu_with_most_free_memory(cuda_count: int) -> int:
-    """Index of the visible CUDA device with the most free VRAM.
+@dataclass(frozen=True)
+class EngineInfo:
+    model: str
+    device: str  # "cuda" or "cpu"
+    compute_type: str
+    reason: str
+    gpu_name: str | None = None
+    gpu_uuid: str | None = None
 
-    On the shared rack this avoids hard-coding a card: the container is given
-    all GPUs (see docker-compose.yml) and we pick the emptiest one at startup,
-    which is the polite thing to do when other jobs share the rack.
 
-    NVML is queried via nvidia-ml-py. Inside the container the NVIDIA runtime
-    masks NVML to exactly the GPUs exposed to us, so NVML indices line up with
-    CTranslate2's indices (both enumerate only the visible set). If NVML is
-    missing or errors, fall back to device 0 rather than failing.
+class Cancelled(Exception):
+    """The job was cancelled while it was being transcribed."""
 
-    Alternative considered: parsing `nvidia-smi --query-gpu=memory.free`. NVML
-    avoids spawning a subprocess and brittle text parsing, so it is preferred.
-    """
-    try:
-        import pynvml
-    except Exception:
-        return 0
-    try:
-        pynvml.nvmlInit()
-    except Exception:
-        return 0
-    try:
-        best_index, best_free = 0, -1
-        for i in range(cuda_count):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            free = pynvml.nvmlDeviceGetMemoryInfo(handle).free
-            if free > best_free:
-                best_index, best_free = i, free
-        return best_index
-    except Exception:
-        return 0
-    finally:
+
+SegmentCallback = Callable[[Segment, float], None]
+"""Called with each segment and the duration of the audio (seconds)."""
+
+
+class Engine(Protocol):
+    info: EngineInfo | None
+
+    def load(self) -> EngineInfo: ...
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        on_segment: SegmentCallback,
+        should_cancel: Callable[[], bool] = lambda: False,
+    ) -> float:
+        """Transcribe one file; returns the audio duration in seconds."""
+        ...
+
+
+def _log(msg: str) -> None:
+    print(f"[uk-transcribe] {msg}", file=sys.stderr, flush=True)
+
+
+class WhisperEngine:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.info: EngineInfo | None = None
+        self._model = None
+
+    def load(self) -> EngineInfo:
+        # The device must be chosen before ctranslate2 touches CUDA: select_device
+        # pins the card through CUDA_VISIBLE_DEVICES.
+        choice = gpu.select_device(self.settings.device, self.settings.min_free_mib)
+        from faster_whisper import WhisperModel  # imported after pinning
+
+        device = choice.device
+        compute = self.settings.compute_type
+        if compute == "auto":
+            compute = "float16" if device == "cuda" else "int8"
+        where = f"{device} ({choice.gpu.name})" if choice.gpu else device
+        _log(f"loading '{self.settings.model}' on {where}, {compute}: {choice.reason}")
         try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
+            self._model = WhisperModel(
+                self.settings.model,
+                device=device,
+                device_index=0,
+                compute_type=compute,
+                cpu_threads=self.settings.cpu_threads,
+            )
+        except Exception as exc:  # noqa: BLE001 - e.g. CUDA OOM on a busy shared card
+            if device != "cuda" or self.settings.device != "auto":
+                raise
+            _log(f"GPU load failed ({exc}); falling back to the CPU")
+            device, compute = "cpu", "int8"
+            choice = gpu.DeviceChoice("cpu", f"GPU load failed: {exc}")
+            self._model = WhisperModel(
+                self.settings.model,
+                device="cpu",
+                compute_type=compute,
+                cpu_threads=self.settings.cpu_threads,
+            )
+        self.info = EngineInfo(
+            model=self.settings.model,
+            device=device,
+            compute_type=compute,
+            reason=choice.reason,
+            gpu_name=choice.gpu.name if choice.gpu else None,
+            gpu_uuid=choice.gpu.uuid if choice.gpu else None,
+        )
+        _log("model ready")
+        return self.info
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        on_segment: SegmentCallback,
+        should_cancel: Callable[[], bool] = lambda: False,
+    ) -> float:
+        if self._model is None:
+            raise RuntimeError("model not loaded")
+        segments, info = self._model.transcribe(
+            str(audio_path),
+            language=LANGUAGE,
+            beam_size=self.settings.beam_size,
+            vad_filter=self.settings.vad,
+        )
+        duration = float(info.duration or 0.0)
+        # The generator is lazy: iterating it is what drives decoding, so a
+        # cancel takes effect between two segments.
+        for seg in segments:
+            if should_cancel():
+                raise Cancelled()
+            on_segment(Segment(float(seg.start), float(seg.end), seg.text.strip()), duration)
+        return duration
 
 
-def select_device() -> tuple[str, str, int]:
-    """Return (device, compute_type, device_index) for the best target.
-
-    ctranslate2 is queried directly instead of importing torch - faster-whisper's
-    backend is CTranslate2, so torch would be gigabytes of dead weight.
-      GPU present -> float16 on the emptiest visible card
-      CPU only    -> int8 (the practical CPU compute type)
-    """
-    try:
-        cuda_count = ctranslate2.get_cuda_device_count()
-    except Exception:
-        # A driver quirk while querying the CUDA runtime is treated as "no GPU"
-        # rather than crashing, so the laptop path is never blocked.
-        cuda_count = 0
-
-    if cuda_count <= 0:
-        return ("cpu", "int8", 0)
-    return ("cuda", "float16", _gpu_with_most_free_memory(cuda_count))
-
-
-def load_model(model_name: str = DEFAULT_MODEL) -> WhisperModel:
-    """Load a faster-whisper model onto the best available device."""
-    device, compute_type, index = select_device()
-    where = f"{device}:{index}" if device == "cuda" else device
-    print(
-        f"[uk-transcribe] loading '{model_name}' on {where} ({compute_type})",
-        file=sys.stderr,
-    )
-    return WhisperModel(
-        model_name,
-        device=device,
-        device_index=index,
-        compute_type=compute_type,
-    )
-
-
-def transcribe_file(
-    model: WhisperModel,
+def transcribe_to_text(
+    engine: Engine,
     audio_path: Path,
-    progress_callback: Optional[ProgressCallback] = None,
+    progress: Optional[Callable[[float], None]] = None,
 ) -> str:
-    """Transcribe one file and return the full text.
-
-    faster-whisper returns a lazy segment generator; iterating it is what drives
-    decoding. Each segment carries an end timestamp, so segment.end / duration
-    is a real progress fraction (not a fake timed spinner). beam_size=5 is the
-    usual quality/speed compromise; vad_filter trims silence, which speeds up
-    lecture audio and cuts the repeated-phrase hallucinations Whisper emits on
-    quiet stretches (onnxruntime, which the VAD needs, ships with faster-whisper).
-    """
-    segments, info = model.transcribe(
-        str(audio_path),
-        language=LANGUAGE,
-        beam_size=5,
-        vad_filter=True,
-    )
-    duration = info.duration or 0.0
+    """Plain-text transcript of one file (used by the CLI)."""
     parts: list[str] = []
-    for segment in segments:
-        parts.append(segment.text)
-        if progress_callback is not None and duration > 0:
-            progress_callback(min(segment.end / duration, 1.0))
-    # Guarantee a final 100% even if the last segment ended before duration
-    # (VAD can trim trailing silence, so the last end < duration).
-    if progress_callback is not None:
-        progress_callback(1.0)
-    # Each segment's text carries its own leading space, so "" is the right join.
-    return "".join(parts).strip()
+
+    def on_segment(seg: Segment, duration: float) -> None:
+        parts.append(seg.text)
+        if progress and duration > 0:
+            progress(min(seg.end / duration, 1.0))
+
+    engine.transcribe(audio_path, on_segment)
+    if progress:
+        progress(1.0)
+    return " ".join(p for p in parts if p).strip()

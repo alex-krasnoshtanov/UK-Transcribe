@@ -1,112 +1,105 @@
 # uk-transcribe
 
-Self-hosted Ukrainian lecture transcription. Upload audio through a web page,
-get the Ukrainian transcript back - running on your own hardware, no per-minute
-cloud fees, no audio leaving the machine. Built on
-[`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) (CTranslate2
-backend) with one code path that runs on a CPU laptop and on the GPU rack
-unchanged.
+Self-hosted Ukrainian transcription. Drop audio or video into a web dashboard
+and get a timestamped Ukrainian transcript back (TXT, SRT, VTT). Everything runs
+on your own hardware or the university cluster, with no per-minute cloud fees
+and no audio leaving the machine. Built on
+[`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) (CTranslate2).
 
-The web UI is the product. There is a small CLI (`main.py`) that shares the same
-core, but it exists only for local tests and headless debugging.
+- **Dashboard** (Next.js, `web/`): drag-and-drop uploads, live queue with
+  progress and ETA, searchable history, a transcript viewer that follows the
+  audio player, downloads, and retention controls.
+- **API** (FastAPI, `app/`): one GPU worker, a durable SQLite queue that
+  survives restarts, and timestamped segments stored as they are decoded.
+- **Deploy** (`deploy/`): the university "Student apps (cluster)" with a
+  **GPU memory slice** (not a whole card), and a script to deploy, stop and
+  start it with the Portainer key kept in Doppler. See
+  [deploy/README.md](deploy/README.md).
+
+Language is always forced to `uk`, because Whisper's auto-detect confuses
+Ukrainian with Russian on accented or noisy audio.
 
 ## Layout
 
 ```
-app/transcriber.py      shared core: device selection, model load, decoding
-app/server.py           FastAPI: /upload, /status/{id}, /download/{id}, /health
-app/static/index.html   single-page UI with a live progress bar
-main.py                 thin CLI over the same core (debug/dev only)
-scripts/                small utility scripts, including audio extraction
-requirements.txt        runtime deps for the Docker image
-pyproject.toml          uv project (core + optional `app` extra + `dev` group)
-Dockerfile              CUDA 12 + cuDNN 9 image; runs the web UI by default
-docker-compose.yml      the one stack to deploy (Portainer)
-.env.example            WHISPER_MODEL / HF_TOKEN / IMAGE / PORT / GPU selection
-outputs/                transcripts + per-job state (git-ignored)
-uploads/                upload scratch, cleared after each job (git-ignored)
-samples/                local test clips (git-ignored)
+app/config.py        settings from environment variables
+app/gpu.py           picks the card with most free VRAM (nvidia-smi), else the CPU
+app/transcriber.py   faster-whisper engine: load once, stream segments
+app/db.py            SQLite job history + queue (atomic, restart-safe)
+app/worker.py        the single transcription worker + retention sweeper
+app/exports.py       TXT / SRT / VTT
+app/server.py        JSON API (see the docstring for the routes)
+web/                 Next.js dashboard; talks to the API via /api/backend
+main.py              CLI over the same engine (debug)
+deploy/cluster.yml   compose stack for the student cluster
+deploy/ukt.sh        deploy / stop / start / status / logs through the Portainer API
+docker-compose.yml   local or desktop run (whole GPU, builds both images)
+tests/               API tests (no GPU needed) + cluster compose rules
 ```
 
-## Run locally (laptop, CPU)
+## Run locally
 
 ```bash
+# API (CPU on a laptop; a small model for quick tests)
 uv sync --extra app
-uv run uvicorn app.server:app --port 8000
+WHISPER_MODEL=small DEVICE=cpu uv run uvicorn app.server:app --port 8002
+
+# Dashboard, in a second terminal
+cd web && npm install && API_URL=http://127.0.0.1:8002 npm run dev
 ```
 
-Open http://localhost:8000, choose a file, click Transcribe. No GPU is detected
-on the laptop, so the model loads on CPU with int8. The first run downloads the
-model (`large-v3` is ~3 GB); set `WHISPER_MODEL=small` for a quick smoke test.
+Open http://localhost:3000. Data goes to `./data` (git-ignored).
 
-Language is always forced to `uk`: Whisper's auto-detect confuses Ukrainian with
-Russian on accented/noisy audio, so it is never trusted.
-
-CLI (debug only), same core:
+With Docker and an NVIDIA GPU (e.g. the RTX 5070 desktop), this runs both
+images with `large-v3` on http://localhost:3000:
 
 ```bash
-uv run python main.py samples/sample_uk.wav --model small
+docker compose up --build
 ```
 
-## Build the image
+CLI (debug):
 
 ```bash
-docker build -t ghcr.io/alex-krasnoshtanov/uk-transcribe:latest .
-docker push ghcr.io/alex-krasnoshtanov/uk-transcribe:latest
+uv run python main.py samples/sample_uk.wav --model small --format srt -o out.srt
 ```
 
-Build on a machine with Docker and push to a registry the Portainer host can
-pull from. The GPU rack itself is usually the easiest place to build.
+## Tests
 
-## Deploy on Portainer
+```bash
+uv run pytest                         # API, worker, exports, cluster compose rules
+cd web && npm test && npm run lint && npm run typecheck && npm run build
+```
 
-Prerequisite: the host has the NVIDIA Container Toolkit installed and Docker can
-see the GPUs (`docker run --rm --gpus all nvidia/cuda:12.3.2-base-ubuntu22.04 nvidia-smi`).
+CI (`.github/workflows/images.yml`) runs the tests on every push. On `main` it
+also builds both images, smoke-tests them on the CPU, and pushes
+`ghcr.io/alex-krasnoshtanov/uk-transcribe[-web]:sha-<short>`.
 
-1. Push the image to a registry the host can pull (GHCR above), or build it on
-   the host.
-2. Portainer -> Stacks -> Add stack. Paste `docker-compose.yml`, or point it at
-   this Git repo.
-3. Set environment variables (Portainer's env editor, or an attached `.env`):
-   `IMAGE`, `WHISPER_MODEL`, `HF_TOKEN`, `PORT`, and optionally
-   `NVIDIA_VISIBLE_DEVICES` to restrict which GPUs are candidates.
-4. Deploy. The first boot downloads the model, so the container stays
-   "starting" (unhealthy) for a few minutes - this is expected; the healthcheck
-   has a 10-minute grace period.
-5. Once healthy, open `http://<host>:<PORT>`.
+## Environment variables (API)
 
-Redeploys reuse the `hf-cache` volume, so the model is not re-downloaded.
+| Variable | Default | Meaning |
+|---|---|---|
+| `WHISPER_MODEL` | `large-v3` | model id or path |
+| `COMPUTE_TYPE` | `auto` | `float16` on a GPU, `int8` on the CPU |
+| `BEAM_SIZE` / `VAD` | `5` / `1` | decoding |
+| `DEVICE` | `auto` | `auto`, `cpu`, or an nvidia-smi index |
+| `MIN_FREE_MIB` | `5000` | in `auto`, use the CPU if no card has this much free |
+| `CPU_THREADS` | `4` | CTranslate2 threads on the CPU |
+| `DATA_DIR` | `./data` (`/data` in the image) | SQLite DB + uploads |
+| `HF_HOME` | HF default (`/models` in the image) | model cache |
+| `MAX_UPLOAD_MB` / `MAX_QUEUE` | `2048` / `50` | limits |
+| `AUDIO_RETENTION_DAYS` / `TRANSCRIPT_RETENTION_DAYS` | `7` / `0` | defaults; the dashboard can change them (0 = keep) |
+| `HF_TOKEN` | – | optional, raises Hugging Face download limits |
 
-## GPU selection
+The dashboard reads one variable: `API_URL` (default `http://127.0.0.1:8000`).
 
-The container is given all visible GPUs and the app picks the one with the most
-free memory at startup (NVML via `nvidia-ml-py`). This avoids hard-coding a card
-on the shared rack and does not exclusively lock the others. Restrict the
-candidate set with `NVIDIA_VISIBLE_DEVICES` if you want to keep off specific
-cards. The choice is made once at startup and held for the process lifetime.
+## Notes
 
-## Environment variables
-
-| Variable                | Purpose                                                    |
-|-------------------------|------------------------------------------------------------|
-| `WHISPER_MODEL`         | model id / path (default `large-v3`)                       |
-| `HF_TOKEN`              | HuggingFace token; raises download rate limits (recommended) |
-| `IMAGE`                 | container image reference                                  |
-| `PORT`                  | host port for the web UI (default 8000)                    |
-| `NVIDIA_VISIBLE_DEVICES`| restrict candidate GPUs (default `all`)                    |
-
-## Notes / gotchas
-
-- **cuDNN**: the image is `nvidia/cuda:12.3.2-cudnn9-runtime` on purpose;
-  CTranslate2 needs CUDA 12 + cuDNN 9, and a `-base` image lacks them.
-- **Progress bar**: driven by `segment.end / audio_duration` from faster-whisper,
-  so it reflects real decoding position, not a timer.
-- **Download name**: `<original-name>_transcribed.txt` (change `DOWNLOAD_SUFFIX`
-  in `app/server.py` to rename the convention).
-- **Batch audio extraction**: `python scripts/extract_audio_from_videos.py`
-   converts videos from `raw_videos/` into mono 16 kHz WAV files in
-   `ready_audios/`, named `<video-stem>_audio.wav`, and skips files that already
-   exist.
-- **Concurrency**: one model instance, one lock. A second upload is queued
-  (shown as "pending") until the first finishes - correct, not concurrent.
-- **HF_TOKEN** also speeds up the large `large-v3` download.
+- **One worker, one model.** Jobs run one at a time on purpose: a second model
+  copy would double the VRAM. The queue is in SQLite, so jobs survive restarts
+  (an interrupted job starts again).
+- **Blackwell GPUs** (RTX 50xx, RTX PRO 6000) need CTranslate2 ≥ 4.9.1 and
+  CUDA ≥ 12.8; both are pinned (`pyproject.toml`, `Dockerfile`).
+- **No login.** The cluster deployment is open to the campus network by
+  choice. Inputs are still validated (ids, sizes, file types).
+- **Batch audio extraction:** `python scripts/extract_audio_from_videos.py`
+  turns videos in `raw_videos/` into 16 kHz mono WAVs in `ready_audios/`.

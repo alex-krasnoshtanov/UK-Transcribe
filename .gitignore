@@ -27,3 +27,7 @@ wheels/
 !/outputs/.gitkeep
 /uploads/*
 !/uploads/.gitkeep
+
+# Local tooling
+.claude/
+data/

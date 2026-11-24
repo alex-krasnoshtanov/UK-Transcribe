@@ -1,0 +1,125 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens. One accent, neutral greys, hairlines instead of shadows.
+ * System fonts on purpose: they cover Cyrillic, and the cluster is campus-only
+ * (no web fonts from outside). Light and dark follow the OS.
+ */
+@theme {
+  --font-sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+
+  --color-canvas: #f6f7f9;
+  --color-surface: #ffffff;
+  --color-hover: #f1f4f8;
+  --color-ink: #111827;
+  --color-ink-2: #4b5563;
+  --color-ink-3: #6b7280;
+  --color-line: #e3e6ea;
+  --color-line-strong: #c9ced6;
+  --color-accent: #1d4ed8;
+  --color-accent-soft: #e0e8fb;
+  --color-ok: #166534;
+  --color-ok-soft: #dcfce7;
+  --color-warn: #8a5300;
+  --color-warn-soft: #fff4dc;
+  --color-bad: #b42318;
+  --color-bad-soft: #fde8e7;
+  --color-mark: #fff1a8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-canvas: #0f1115;
+    --color-surface: #171a21;
+    --color-hover: #1e222b;
+    --color-ink: #e7e9ee;
+    --color-ink-2: #b4bac6;
+    --color-ink-3: #8b93a3;
+    --color-line: #2a2f3a;
+    --color-line-strong: #3a414f;
+    --color-accent: #7aa2ff;
+    --color-accent-soft: #1f2a44;
+    --color-ok: #6ee7a0;
+    --color-ok-soft: #14301f;
+    --color-warn: #f5c26b;
+    --color-warn-soft: #3a2c10;
+    --color-bad: #ff8a80;
+    --color-bad-soft: #3d1715;
+    --color-mark: #5a4b00;
+  }
+}
+
+@layer base {
+  html {
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.45;
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+  }
+  a {
+    color: var(--color-accent);
+    text-underline-offset: 2px;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+  mark {
+    background: var(--color-mark);
+    color: inherit;
+    border-radius: 2px;
+  }
+}
+
+@layer components {
+  .card {
+    background: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: 8px;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    border: 1px solid var(--color-line-strong);
+    background: var(--color-surface);
+    color: var(--color-ink);
+    border-radius: 6px;
+    padding: 0.3rem 0.7rem;
+    font-size: 13px;
+    cursor: pointer;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) {
+    background: var(--color-hover);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .btn-primary {
+    background: var(--color-accent);
+    border-color: var(--color-accent);
+    color: var(--color-surface);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--color-accent);
+    filter: brightness(1.08);
+  }
+  .btn-danger {
+    color: var(--color-bad);
+  }
+  .input {
+    border: 1px solid var(--color-line-strong);
+    background: var(--color-surface);
+    color: var(--color-ink);
+    border-radius: 6px;
+    padding: 0.35rem 0.6rem;
+    font-size: 13px;
+  }
+}

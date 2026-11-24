@@ -1,0 +1,155 @@
+name: Images
+
+# Tests on every push and pull request. On main it also builds both images,
+# smoke-tests them on the CPU, and pushes them to GHCR:
+#   ghcr.io/alex-krasnoshtanov/uk-transcribe:sha-<short>      (and :main)
+#   ghcr.io/alex-krasnoshtanov/uk-transcribe-web:sha-<short>  (and :main)
+# Deploying is a separate, manual step from a laptop on the university network:
+#   doppler run -- bash deploy/ukt.sh deploy        (deploy/README.md)
+# Both packages must be Public once, or the cluster cannot pull them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  UV_VERSION: "0.13.9"
+  OWNER: alex-krasnoshtanov
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: API tests (incl. the cluster compose rules)
+        run: |
+          uv sync --locked --extra app --no-default-groups --group test
+          uv run --no-sync pytest -q
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Dashboard checks
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run lint
+          npm run typecheck
+          npm test
+
+      - name: Deploy script syntax
+        run: bash -n deploy/ukt.sh
+
+  build:
+    name: Build and push
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The CUDA image needs more disk than a hosted runner has free.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift
+          docker system prune -af >/dev/null
+          df -h /
+
+      - name: Tags
+        id: tags
+        run: |
+          short="${GITHUB_SHA::7}"
+          echo "tag=sha-${short}" >> "$GITHUB_OUTPUT"
+          echo "api=ghcr.io/${OWNER}/uk-transcribe" >> "$GITHUB_OUTPUT"
+          echo "web=ghcr.io/${OWNER}/uk-transcribe-web" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          TAG: ${{ steps.tags.outputs.tag }}
+          API: ${{ steps.tags.outputs.api }}
+          WEB: ${{ steps.tags.outputs.web }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          docker build --build-arg "GIT_SHA=${TAG}" \
+            --label "org.opencontainers.image.source=${SOURCE}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${API}:${TAG}" -t "${API}:main" .
+          docker build --label "org.opencontainers.image.source=${SOURCE}" \
+            -t "${WEB}:${TAG}" -t "${WEB}:main" web
+
+      # No GPU here: the API falls back to the CPU with the tiny model, which is
+      # enough to know the image starts, transcribes and serves through the dashboard.
+      - name: Smoke test
+        env:
+          TAG: ${{ steps.tags.outputs.tag }}
+          API: ${{ steps.tags.outputs.api }}
+          WEB: ${{ steps.tags.outputs.web }}
+        run: |
+          docker network create ukt-smoke
+          trap 'docker logs --tail 60 ukt-api || true; docker rm -f ukt-api ukt-web >/dev/null 2>&1 || true' EXIT
+          docker run -d --name ukt-api --network ukt-smoke -e WHISPER_MODEL=tiny -e DEVICE=cpu "${API}:${TAG}"
+          docker run -d --name ukt-web --network ukt-smoke -e API_URL=http://ukt-api:8000 -p 3000:8000 "${WEB}:${TAG}"
+          for _ in $(seq 1 60); do
+            if curl -sf localhost:3000/api/backend/healthz >/dev/null; then break; fi
+            sleep 5
+          done
+          curl -sf localhost:3000/api/backend/healthz
+          python3 -c "import wave; w=wave.open('/tmp/s.wav','wb'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(b'\0\0'*32000); w.close()"
+          id=$(curl -sf -X POST -H 'Content-Type: application/octet-stream' --data-binary @/tmp/s.wav \
+            'localhost:3000/api/backend/jobs?filename=smoke.wav' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          for _ in $(seq 1 60); do
+            status=$(curl -sf "localhost:3000/api/backend/jobs/${id}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+            [[ "$status" == done ]] && break
+            [[ "$status" == error ]] && { echo "::error::smoke job failed"; exit 1; }
+            sleep 2
+          done
+          [[ "$status" == done ]] || { echo "::error::smoke job did not finish"; exit 1; }
+          curl -sf "localhost:3000/api/backend/jobs/${id}/transcript.vtt" | head -1 | grep -q WEBVTT
+          echo "smoke test passed"
+
+      - name: Push to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          TAG: ${{ steps.tags.outputs.tag }}
+          API: ${{ steps.tags.outputs.api }}
+          WEB: ${{ steps.tags.outputs.web }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          for image in "$API" "$WEB"; do
+            docker push "${image}:${TAG}"
+            docker push "${image}:main"
+          done
+          echo "### Pushed \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy: \`doppler run -- bash deploy/ukt.sh deploy ${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io || true

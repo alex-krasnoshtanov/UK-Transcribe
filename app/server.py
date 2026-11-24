@@ -1,194 +1,368 @@
-"""FastAPI web UI - the primary entry point for the project.
+"""JSON API for the transcription service (the Next.js dashboard in web/ is its UI).
 
-A single-user, self-hosted transcription service: upload an audio file, watch a
-progress bar, download the Ukrainian transcript. Deliberately minimal for
-occasional single-user use (project plan, Phase 5): no auth, no database, and
-FastAPI BackgroundTasks instead of a real job queue. A multi-user deployment
-would need a durable queue (Celery/RQ) and persistent job state instead.
+- POST   /jobs?filename=<name>      raw request body = the audio file; queues a job
+- GET    /jobs                      history (q, status, limit, offset)
+- GET    /jobs/{id}                 one job with progress, queue position, ETA
+- GET    /jobs/{id}/segments        timestamped transcript (after=<idx> for live updates)
+- GET    /jobs/{id}/transcript.{txt,srt,vtt}
+- GET    /jobs/{id}/audio           the uploaded file (range requests, for the player)
+- POST   /jobs/{id}/cancel | /retry
+- DELETE /jobs/{id}                 job, transcript and audio
+- DELETE /jobs/{id}/audio           audio only, keeps the transcript
+- GET    /queue                     running + queued jobs
+- GET    /settings, PUT /settings   retention (days, 0 = keep)
+- GET    /healthz                   readiness: 503 until the model is loaded
 
-Job state is a folder under outputs/<job_id>/ holding a status.json and, once
-finished, a transcript.txt. Trade-off accepted for v1: a process restart
-mid-job leaves that job stuck in 'processing' and it is not retried - fine at
-this scale.
+No login: the deployment is open to the campus network by choice. Inputs are
+still validated (ids, sizes, file types) because that network is shared.
 """
 
 from __future__ import annotations
 
-import json
-import shutil
-import threading
+import mimetypes
+import os
+import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
+from urllib.parse import quote
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, Field
 
-from app.transcriber import DEFAULT_MODEL, load_model, transcribe_file
+from app import gpu
+from app.config import Settings
+from app.db import Store
+from app.exports import FORMATS
+from app.transcriber import Engine, WhisperEngine
+from app.worker import Worker, delete_audio, retention
 
-APP_DIR = Path(__file__).resolve().parent
-BASE_DIR = APP_DIR.parent
-OUTPUTS_DIR = BASE_DIR / "outputs"
-UPLOADS_DIR = BASE_DIR / "uploads"
-INDEX_HTML = APP_DIR / "static" / "index.html"
-
-# Suffix added to the downloaded transcript filename, e.g. lecture.mp3 ->
-# lecture_transcribed.txt. One constant to change if you want a different word.
-DOWNLOAD_SUFFIX = "_transcribed"
-
-# The model is loaded once at startup and reused for every job (large-v3 is
-# ~3 GB; reloading per request would dominate runtime). One lock serialises
-# decoding so concurrent background jobs never touch the same model instance at
-# once - correctness over throughput, the right trade at single-user scale.
-_state: dict[str, object] = {}
-_model_lock = threading.Lock()
+JOB_ID = re.compile(r"^[0-9a-f]{32}$")
+CHUNK = 1024 * 1024
 
 
-def _job_dir(job_id: str) -> Path:
-    return OUTPUTS_DIR / job_id
-
-
-def _read_status(job_id: str) -> dict | None:
-    status_path = _job_dir(job_id) / "status.json"
-    if not status_path.is_file():
-        return None
-    return json.loads(status_path.read_text(encoding="utf-8"))
-
-
-def _write_status(
-    job_id: str,
-    status: str,
-    *,
-    progress: float = 0.0,
-    detail: str = "",
-    original_name: str = "",
-) -> None:
-    """Persist job state, merging onto any existing record.
-
-    Merging means a progress-only update does not clobber the original_name
-    captured at upload time, and vice versa.
-    """
-    job_dir = _job_dir(job_id)
-    job_dir.mkdir(parents=True, exist_ok=True)
-    record = _read_status(job_id) or {}
-    record.update({"job_id": job_id, "status": status, "progress": round(progress, 4)})
-    if detail:
-        record["detail"] = detail
-    if original_name:
-        record["original_name"] = original_name
-    (job_dir / "status.json").write_text(json.dumps(record), encoding="utf-8")
-
-
-def _run_job(job_id: str, audio_path: Path) -> None:
-    """Background worker: transcribe one uploaded file, updating status.json."""
-    last_written = -1.0
-
-    def on_progress(fraction: float) -> None:
-        nonlocal last_written
-        # Throttle disk writes: only persist when progress advances >=1% (or
-        # hits 100%), so a lecture with hundreds of segments does not rewrite
-        # status.json hundreds of times.
-        if fraction - last_written >= 0.01 or fraction >= 1.0:
-            last_written = fraction
-            _write_status(job_id, "processing", progress=fraction)
-
+def _probe_duration(path: Path) -> float | None:
+    """Audio length in seconds, or None if the file cannot be decoded."""
     try:
-        # The lock is acquired before flipping to "processing": a second upload
-        # stays "pending" (queued) in its status.json until this one releases.
-        with _model_lock:
-            _write_status(job_id, "processing", progress=0.0)
-            text = transcribe_file(_state["model"], audio_path, on_progress)
-        (_job_dir(job_id) / "transcript.txt").write_text(text, encoding="utf-8")
-        _write_status(job_id, "done", progress=1.0)
-    except Exception as exc:  # noqa: BLE001 - any failure is surfaced to the client
-        _write_status(job_id, "error", detail=str(exc))
-    finally:
-        # The uploaded audio is only needed for the transcription itself.
-        audio_path.unlink(missing_ok=True)
+        import av
+
+        with av.open(str(path)) as container:
+            if not container.streams.audio:
+                return None
+            if container.duration:
+                return container.duration / 1_000_000
+            stream = container.streams.audio[0]
+            if stream.duration and stream.time_base:
+                return float(stream.duration * stream.time_base)
+            return 0.0
+    except Exception:  # noqa: BLE001 - any decode failure means "not audio"
+        return None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    # Load weights at startup, not lazily per request, so the first user upload
-    # is not penalised with a multi-GB download. FastAPI does not serve requests
-    # until this completes, so no request can race an unloaded model.
-    _state["model"] = load_model(DEFAULT_MODEL)
-    yield
-    _state.clear()
+def _clean_name(filename: str) -> str:
+    """Display name: basename only, no control characters, at most 200 chars."""
+    name = Path(filename.replace("\\", "/")).name
+    name = "".join(c for c in name if c.isprintable() and c not in '<>:"/\\|?*').strip()
+    return name[:200] or "audio"
 
 
-app = FastAPI(title="uk-transcribe", lifespan=lifespan)
+def _disposition(filename: str) -> str:
+    ascii_name = "".join(c if c.isascii() and c.isalnum() or c in "-_." else "_" for c in filename)
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
 
 
-def _safe_stem(filename: str | None) -> str:
-    """Sanitised base name for the download, from the uploaded filename.
-
-    Strips the directory and extension, then keeps only characters that are safe
-    in a Content-Disposition header and on any filesystem. Falls back to
-    'transcript' if nothing usable remains.
-    """
-    stem = Path(filename or "").stem
-    cleaned = "".join(c for c in stem if c.isalnum() or c in (" ", "-", "_")).strip()
-    return cleaned or "transcript"
+class RetentionIn(BaseModel):
+    audio_retention_days: int = Field(ge=0, le=3650)
+    transcript_retention_days: int = Field(ge=0, le=3650)
 
 
-@app.get("/", response_class=HTMLResponse)
-def index() -> HTMLResponse:
-    return HTMLResponse(INDEX_HTML.read_text(encoding="utf-8"))
+def create_app(settings: Settings | None = None, engine: Engine | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    engine = engine or WhisperEngine(settings)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+        store = Store(settings.db_path)
+        worker = Worker(store, engine, settings)
+        app.state.store, app.state.worker = store, worker
+        # The model loads in the worker thread, so history and the dashboard work
+        # while it loads; /healthz stays 503 (not ready) until it is done.
+        worker.start()
+        yield
+        worker.stop()
+        store.close()
+
+    app = FastAPI(title="uk-transcribe", version=settings.version, lifespan=lifespan)
+
+    def store_of(request: Request) -> Store:
+        return request.app.state.store
+
+    def get_job_or_404(store: Store, job_id: str) -> dict[str, Any]:
+        if not JOB_ID.match(job_id):
+            raise HTTPException(404, "unknown job")
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(404, "unknown job")
+        return job
+
+    def public(store: Store, job: dict[str, Any]) -> dict[str, Any]:
+        now = time.time()
+        out = {
+            "id": job["id"],
+            "filename": job["filename"],
+            "status": job["status"],
+            "progress": round(job["progress"] or 0.0, 4),
+            "duration": job["duration"],
+            "size_bytes": job["size_bytes"],
+            "model": job["model"],
+            "device": job["device"],
+            "error": job["error"],
+            "created_at": job["created_at"],
+            "started_at": job["started_at"],
+            "finished_at": job["finished_at"],
+            "audio_available": job["audio_deleted_at"] is None and bool(job["audio_path"])
+            and Path(job["audio_path"]).is_file(),
+            "eta_seconds": None,
+            "queue_position": None,
+        }
+        if job["status"] == "processing":
+            left = remaining(job, store.speed(), now)
+            out["eta_seconds"] = round(left) if left is not None else None
+        elif job["status"] == "queued":
+            out["queue_position"] = store.queue_position(job["id"])
+            # Time left for everything ahead of it, plus its own length.
+            speed = store.speed()
+            ahead = [
+                j for j in store.active_jobs()
+                if j["status"] == "processing" or j["created_at"] < job["created_at"]
+            ]
+            total = 0.0
+            for j in ahead + [job]:
+                left = remaining(j, speed, now)
+                if left is None:
+                    total = -1.0
+                    break
+                total += left
+            out["eta_seconds"] = round(total) if total >= 0 else None
+        return out
+
+    def remaining(job: dict[str, Any], speed: float | None, now: float) -> float | None:
+        """Seconds until this job is done, or None when there is no basis to guess."""
+        if job["status"] == "processing" and job["started_at"]:
+            elapsed = now - job["started_at"]
+            p = job["progress"] or 0.0
+            if p >= 0.03:
+                return elapsed / p * (1 - p)
+            if speed and job["duration"]:
+                return max(job["duration"] * speed - elapsed, 0.0)
+            return None
+        if speed and job["duration"]:
+            return job["duration"] * speed
+        return None
+
+    # --- jobs ---------------------------------------------------------------------
+
+    @app.post("/jobs", status_code=201)
+    async def create_job(request: Request, filename: str = Query(min_length=1, max_length=400)):
+        store = store_of(request)
+        name = _clean_name(filename)
+        suffix = Path(name).suffix.lower()
+        if suffix not in settings.allowed_suffixes:
+            raise HTTPException(415, f"unsupported file type '{suffix or '?'}'")
+        if store.queue_length() >= settings.max_queue:
+            raise HTTPException(429, "the queue is full, try again later")
+        limit = settings.max_upload_mb * 1024 * 1024
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > limit:
+            raise HTTPException(413, f"file is larger than {settings.max_upload_mb} MB")
+
+        job_id = uuid.uuid4().hex
+        final = settings.uploads_dir / f"{job_id}{suffix}"
+        part = final.with_suffix(final.suffix + ".part")
+        size = 0
+        try:
+            with part.open("wb") as out:
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > limit:
+                        raise HTTPException(413, f"file is larger than {settings.max_upload_mb} MB")
+                    out.write(chunk)
+            if size == 0:
+                raise HTTPException(400, "empty upload")
+            duration = await run_in_threadpool(_probe_duration, part)
+            if duration is None:
+                raise HTTPException(415, "the file has no audio track that can be decoded")
+            os.replace(part, final)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        store.add_job(job_id, name, final, size, duration)
+        request.app.state.worker.notify()
+        return public(store, store.get_job(job_id))
+
+    @app.get("/jobs")
+    def list_jobs(
+        request: Request,
+        q: str = Query("", max_length=200),
+        status: str = Query("", pattern="^(|queued|processing|done|error|cancelled)$"),
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0),
+    ):
+        store = store_of(request)
+        rows, total = store.list_jobs(q=q.strip(), status=status, limit=limit, offset=offset)
+        return {"total": total, "items": [public(store, r) for r in rows]}
+
+    @app.get("/jobs/{job_id}")
+    def get_job(request: Request, job_id: str):
+        store = store_of(request)
+        return public(store, get_job_or_404(store, job_id))
+
+    @app.get("/jobs/{job_id}/segments")
+    def get_segments(request: Request, job_id: str, after: int = Query(-1, ge=-1)):
+        store = store_of(request)
+        get_job_or_404(store, job_id)
+        return [
+            {"idx": s.idx, "start": s.start, "end": s.end, "text": s.text}
+            for s in store.segments(job_id, after)
+        ]
+
+    @app.get("/jobs/{job_id}/transcript.{fmt}")
+    def get_transcript(request: Request, job_id: str, fmt: str):
+        store = store_of(request)
+        job = get_job_or_404(store, job_id)
+        if fmt not in FORMATS:
+            raise HTTPException(404, "unknown format")
+        render, media_type = FORMATS[fmt]
+        body = render(store.segments(job_id))
+        stem = Path(job["filename"]).stem or "transcript"
+        return Response(
+            body,
+            media_type=media_type,
+            headers={"Content-Disposition": _disposition(f"{stem}.{fmt}")},
+        )
+
+    @app.get("/jobs/{job_id}/audio")
+    def get_audio(request: Request, job_id: str):
+        store = store_of(request)
+        job = get_job_or_404(store, job_id)
+        path = Path(job["audio_path"] or "")
+        if job["audio_deleted_at"] is not None or not path.is_file():
+            raise HTTPException(410, "audio was deleted")
+        media_type = mimetypes.guess_type(job["filename"])[0] or "application/octet-stream"
+        return FileResponse(path, media_type=media_type)
+
+    @app.post("/jobs/{job_id}/cancel")
+    def cancel_job(request: Request, job_id: str):
+        store = store_of(request)
+        job = get_job_or_404(store, job_id)
+        if job["status"] == "queued":
+            store.cancel_queued(job_id)
+        elif job["status"] == "processing":
+            store.request_cancel(job_id)
+        else:
+            raise HTTPException(409, f"job is {job['status']}")
+        return public(store, store.get_job(job_id))
+
+    @app.post("/jobs/{job_id}/retry")
+    def retry_job(request: Request, job_id: str):
+        store = store_of(request)
+        get_job_or_404(store, job_id)
+        if store.queue_length() >= settings.max_queue:
+            raise HTTPException(429, "the queue is full, try again later")
+        if not store.requeue(job_id):
+            raise HTTPException(409, "only failed or cancelled jobs with their audio can be retried")
+        request.app.state.worker.notify()
+        return public(store, store.get_job(job_id))
+
+    @app.delete("/jobs/{job_id}", status_code=204)
+    def delete_job(request: Request, job_id: str):
+        store = store_of(request)
+        job = get_job_or_404(store, job_id)
+        if job["status"] == "processing":
+            # The worker stops at the next segment and removes the file.
+            store.request_cancel(job_id)
+            store.delete_job(job_id)
+        else:
+            delete_audio(store, job)
+            store.delete_job(job_id)
+        return Response(status_code=204)
+
+    @app.delete("/jobs/{job_id}/audio", status_code=204)
+    def delete_job_audio(request: Request, job_id: str):
+        store = store_of(request)
+        job = get_job_or_404(store, job_id)
+        if job["status"] in ("queued", "processing"):
+            raise HTTPException(409, "the job still needs its audio")
+        delete_audio(store, job)
+        return Response(status_code=204)
+
+    # --- queue, settings, health --------------------------------------------------------
+
+    @app.get("/queue")
+    def queue(request: Request):
+        store = store_of(request)
+        return {"items": [public(store, j) for j in store.active_jobs()]}
+
+    @app.get("/settings")
+    def get_settings(request: Request):
+        store = store_of(request)
+        audio, transcript = retention(store, settings)
+        return {
+            "audio_retention_days": audio,
+            "transcript_retention_days": transcript,
+            "max_upload_mb": settings.max_upload_mb,
+            "max_queue": settings.max_queue,
+            "allowed_types": sorted(settings.allowed_suffixes),
+            "model": settings.model,
+            "beam_size": settings.beam_size,
+            "vad": settings.vad,
+        }
+
+    @app.put("/settings")
+    def put_settings(request: Request, body: RetentionIn):
+        store = store_of(request)
+        store.set_setting("audio_retention_days", str(body.audio_retention_days))
+        store.set_setting("transcript_retention_days", str(body.transcript_retention_days))
+        return get_settings(request)
+
+    @app.get("/healthz")
+    def healthz(request: Request):
+        worker: Worker = request.app.state.worker
+        info = engine.info
+        body: dict[str, Any] = {
+            "version": settings.version,
+            "model": settings.model,
+            "queue": store_of(request).queue_length(),
+            "current_job": worker.current_job,
+        }
+        if worker.load_error:
+            body.update(status="error", error=worker.load_error)
+            return JSONResponse(body, status_code=503)
+        if not worker.ready.is_set() or info is None:
+            body["status"] = "loading"
+            return JSONResponse(body, status_code=503)
+        body.update(
+            status="ok",
+            device=info.device,
+            compute_type=info.compute_type,
+            device_reason=info.reason,
+            gpu=info.gpu_name,
+            gpu_free_mib=gpu.free_mib(info.gpu_uuid),
+        )
+        return body
+
+    return app
 
 
-@app.get("/health")
-def health() -> JSONResponse:
-    # Healthy only once the model is loaded. The Docker healthcheck relies on
-    # this so Portainer reports the service ready only when it can actually work
-    # (the first startup downloads the model, which takes a while).
-    ready = _state.get("model") is not None
-    return JSONResponse(
-        {"status": "ok" if ready else "loading"},
-        status_code=200 if ready else 503,
-    )
-
-
-@app.post("/upload")
-def upload(file: UploadFile, background_tasks: BackgroundTasks) -> dict:
-    # Sync endpoint on purpose: FastAPI runs it in a threadpool, so the streamed
-    # disk write below does not block the event loop that serves /status polls.
-    job_id = uuid.uuid4().hex
-    # Preserve the original suffix so faster-whisper/PyAV can identify the
-    # container format; the stored name is the job id to avoid collisions.
-    suffix = Path(file.filename or "").suffix
-    audio_path = UPLOADS_DIR / f"{job_id}{suffix}"
-    # Stream to disk in chunks rather than loading the whole file into memory;
-    # lecture recordings can be hundreds of MB.
-    with audio_path.open("wb") as out:
-        shutil.copyfileobj(file.file, out)
-
-    _write_status(
-        job_id, "pending", progress=0.0, original_name=_safe_stem(file.filename)
-    )
-    background_tasks.add_task(_run_job, job_id, audio_path)
-    return {"job_id": job_id}
-
-
-@app.get("/status/{job_id}")
-def status(job_id: str) -> dict:
-    result = _read_status(job_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail="unknown job id")
-    return result
-
-
-@app.get("/download/{job_id}")
-def download(job_id: str) -> FileResponse:
-    transcript_path = _job_dir(job_id) / "transcript.txt"
-    if not transcript_path.is_file():
-        raise HTTPException(status_code=404, detail="transcript not ready")
-    record = _read_status(job_id) or {}
-    stem = record.get("original_name") or "transcript"
-    return FileResponse(
-        transcript_path,
-        media_type="text/plain; charset=utf-8",
-        filename=f"{stem}{DOWNLOAD_SUFFIX}.txt",
-    )
+def __getattr__(name: str):
+    # `uvicorn app.server:app` builds the app lazily from the environment, so
+    # importing this module in tests does not load a model.
+    if name == "app":
+        globals()["app"] = create_app()
+        return globals()["app"]
+    raise AttributeError(name)

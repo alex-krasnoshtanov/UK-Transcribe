@@ -1,13 +1,9 @@
-# Keep the build context small and never bake private data / local caches into
-# the image. samples, outputs and uploads are provided at runtime via volumes.
-.git
-.gitignore
-.venv
-venv
-__pycache__
-*.pyc
-.env
-samples
-outputs
-uploads
-*.md
+# Only pyproject.toml, uv.lock, app/ and main.py go into the API image, and
+# web/ has its own build. Keep everything else (multi-GB audio included) out of
+# the build context.
+*
+!pyproject.toml
+!uv.lock
+!main.py
+!app/
+app/**/__pycache__

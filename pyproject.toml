@@ -1,31 +1,41 @@
 [project]
 name = "uk-transcribe"
-version = "0.1.0"
-description = "Self-hosted Ukrainian lecture transcription (faster-whisper + web UI)"
+version = "0.2.0"
+description = "Self-hosted Ukrainian transcription: faster-whisper API + Next.js dashboard"
 readme = "README.md"
 requires-python = ">=3.12"
-# Runtime dependencies. torch is intentionally absent: the CUDA check uses
-# ctranslate2 (faster-whisper's own backend), so torch would be gigabytes of
-# dead weight. nvidia-ml-py is only used to pick the emptiest GPU at startup.
+# torch is intentionally absent: faster-whisper runs on CTranslate2, and the GPU
+# is chosen from nvidia-smi (app/gpu.py), so torch would be gigabytes of dead weight.
 dependencies = [
     "faster-whisper>=1.2.1",
-    "nvidia-ml-py>=12.0.0",
+    "av>=14.0.0",
+    # 4.9.1 is the first release built with Blackwell (sm_100/sm_120) kernels,
+    # needed on the cluster's RTX PRO 6000 node and the RTX 5070 desktop.
+    "ctranslate2>=4.9.1",
 ]
 
-# Web UI. Optional so a bare CLI/debug install stays lean; the web deps come in
-# with `uv sync --extra app`. The Docker image always installs them (via
-# requirements.txt) since one image serves the whole product.
+# The API server. Optional so a bare CLI install stays lean; the Docker image
+# installs it with `uv sync --extra app`.
 [project.optional-dependencies]
 app = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
-    "python-multipart>=0.0.9",
 ]
 
-# yt-dlp is used only to source/prepare test audio, never at runtime, so it is a
-# dev-tooling group rather than a project dependency. uv installs this group by
-# default on `uv sync`; the Docker image never gets it (built from requirements.txt).
 [dependency-groups]
+# yt-dlp only sources test audio; never needed at runtime.
 dev = [
     "yt-dlp>=2026.7.4",
 ]
+test = [
+    "pytest>=8.3",
+    "httpx>=0.28",
+    "pyyaml>=6.0",
+]
+
+[tool.uv]
+default-groups = ["dev", "test"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]

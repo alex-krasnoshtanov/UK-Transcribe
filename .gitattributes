@@ -1,0 +1,2 @@
+# Shell scripts run in bash (Git Bash, CI): never CRLF.
+*.sh text eol=lf
