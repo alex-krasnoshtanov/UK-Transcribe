@@ -18,8 +18,8 @@ from it at run time. They are never in git and never printed (masked in logs).
 
 | | |
 |---|---|
-| Dashboard | `http://194.171.191.229:30500` (any node answers; campus Wi-Fi or VPN) |
-| Services | `ukt-api` (FastAPI + faster-whisper, 6 GiB GPU slice, not published) · `ukt-web` (Next.js, port 30500) |
+| Dashboard | `http://194.171.191.229:31847` (any node answers; campus Wi-Fi or VPN) |
+| Services | `ukt-api` (FastAPI + faster-whisper, 6 GiB GPU slice, not published) · `ukt-web` (Next.js, port 31847) |
 | Data | volumes `ukt-data` (SQLite + uploads, 20 Gi) and `ukt-models` (Hugging Face cache, 10 Gi) |
 | Images | `ghcr.io/alex-krasnoshtanov/uk-transcribe[-web]:sha-<short>`, built by CI on `main` |
 | Runner | stack `ukt-runner`, runner `uni-apps-ukt` (no ports, 1 CPU / 512 MB) |
@@ -48,9 +48,12 @@ every push.
   update such a stack. (The runner is the exception: it needs neither.)
 - **Public images only, no builds, no bind mounts.** CI pushes to GHCR; the
   packages must be **Public**.
-- **Ports 30000–32699 only.** 30500 is ours, and `deploy` checks nobody else
-  holds it. To move, set the repository variable `WEB_PORT`. Other projects use
-  32025–32031.
+- **Ports 30000–32699 only, and shared with the whole cluster.** They are
+  NodePorts, so services in other namespaces hold some that this account
+  cannot list. 30500, for example, was taken. 31847 is ours. Before each
+  deploy, `deploy` checks from the network that nothing else answers on it, and
+  if something does, it suggests free ports. To move, set the repository
+  variable `WEB_PORT`.
 - **Service names are shared DNS names** in the namespace, hence the `ukt-` prefix.
 - **New volumes are root-owned**; `deploy` hands them to uid 10001 once with a
   short busybox helper.
@@ -151,12 +154,12 @@ describes:
 1. Run `stop` (a volume takes one container at a time).
 2. In Portainer, Student apps (cluster), add a container:
    - Image `busybox:1.37`, user `0:0`, restart `unless-stopped`.
-   - Volume `ukt-data` on `/d`, read-only. Port `30501` → `8000`.
+   - Volume `ukt-data` on `/d`, read-only. Port `31848` → `8000`.
    - Environment `PW` (a long random password) and `FILE` (a random name
      ending in `.tar`).
    - Command:
      `sh -c 'mkdir /srv && tar cf "/srv/$FILE" -C /d . && printf "/:ukt:%s\n" "$PW" > /tmp/httpd.conf && exec httpd -f -p 8000 -h /srv -c /tmp/httpd.conf'`
-3. `curl -u "ukt:<PW>" -o ukt-data.tar "http://194.171.191.229:30501/<FILE>"`
+3. `curl -u "ukt:<PW>" -o ukt-data.tar "http://194.171.191.229:31848/<FILE>"`
 4. Remove the helper, then run `start`.
 
 To restore, reverse it: serve the tar from a machine the cluster can reach,
@@ -171,7 +174,7 @@ To restore, reverse it: serve the tar from a machine the cluster can reach,
 | `refused the token (HTTP 401)` | the Portainer token expired: make a new one, `doppler secrets set PORTAINER_TOKEN` |
 | `permission_denied: write_package` | step 3 of the setup (package not linked to the repo) |
 | `is not pullable anonymously` | the Images run hasn't finished, or the package is still private |
-| `port 30500 is used by …` | another team took it: set the repository variable `WEB_PORT` (e.g. 30510) |
+| `port 31847 is already used` / `provided port is already allocated` | taken outside our stack: set the repository variable `WEB_PORT` to one of the free ports the error lists |
 | pill says `CPU (slow)` | the card had < 5 GB free at startup: `stop`, then `start` later |
 | `is a Swarm stack` | someone created `ukt` in the UI: remove it in Portainer, deploy again |
 | api stays `starting` for a long time | the first model download; run `logs-api` |

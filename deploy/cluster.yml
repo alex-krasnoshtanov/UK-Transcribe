@@ -17,7 +17,7 @@
 # Variables (set by deploy/ukt.sh):
 #   API_IMAGE  ghcr.io/alex-krasnoshtanov/uk-transcribe:sha-<short>
 #   WEB_IMAGE  ghcr.io/alex-krasnoshtanov/uk-transcribe-web:sha-<short>
-#   WEB_PORT   default 30500
+#   WEB_PORT   default 31847
 
 services:
   ukt-api:
@@ -77,7 +77,7 @@ services:
       API_URL: http://ukt-api:8000
       NODE_OPTIONS: --max-old-space-size=256
     ports:
-      - "${WEB_PORT:-30500}:8000"
+      - "${WEB_PORT:-31847}:8000"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s

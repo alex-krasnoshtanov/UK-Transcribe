@@ -67,7 +67,7 @@ def test_ports():
         for port in service.get("ports", []):
             resolved = re.sub(r"\$\{[A-Z_]+:-(\d+)\}", r"\1", port)
             published.append(int(resolved.split(":")[0]))
-    assert published == [30500]  # only the dashboard is published
+    assert published == [31847]  # only the dashboard is published
     assert all(30000 <= p <= 32699 for p in published)
     assert "ports" not in SERVICES["ukt-api"]
 

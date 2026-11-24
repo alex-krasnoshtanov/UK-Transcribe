@@ -20,7 +20,7 @@
 #   PORTAINER_ENDPOINT_ID  16, "Student apps (cluster)"
 #   PORTAINER_INSECURE     1: Portainer's certificate is self-signed
 # Optional:
-#   WEB_PORT      default 30500 (the cluster allows 30000-32699)
+#   WEB_PORT      default 31847 (the cluster allows 30000-32699)
 #   NODE_IP       default 194.171.191.229, used for the URL it prints
 #   WAIT_SECONDS  default 1800 (the first start pulls a multi-GB image and the model)
 set -euo pipefail
@@ -36,7 +36,7 @@ WEB_REPO="${OWNER}/uk-transcribe-web"
 SERVICES="ukt-api ukt-web"
 # name:size:uid:gid; the api runs as 10001 (Dockerfile, deploy/cluster.yml)
 VOLUMES="ukt-data:20Gi:10001:10001 ukt-models:10Gi:10001:10001"
-WEB_PORT="${WEB_PORT:-30500}"  # empty (an unset Actions variable) = 30500
+WEB_PORT="${WEB_PORT:-31847}"  # empty (an unset Actions variable) = 31847
 NODE_IP="${NODE_IP:-194.171.191.229}"
 WAIT_SECONDS="${WAIT_SECONDS:-1800}"
 POLL_SECONDS=10
@@ -119,10 +119,25 @@ image_exists() {  # repo tag
     "https://ghcr.io/v2/$1/manifests/$2")" == "200" ]]
 }
 
-port_taken_by_others() {  # prints the container holding WEB_PORT outside our stack
-  api "${DOCKER}/containers/json?all=1" | jq -r --argjson p "$WEB_PORT" --arg s "$STACK_NAME" '
-    .[] | select((.Labels["com.docker.compose.project"] // "") != $s)
-        | select(any(.Ports[]?; .PublicPort == $p)) | .Names[0]' | head -1
+# Ports are NodePorts, shared with services this account cannot list (other
+# namespaces), so a port is checked from the network: something answering on
+# it that is not our own stack means it is taken.
+port_answers() { timeout 3 bash -c "</dev/tcp/${NODE_IP}/$1" 2>/dev/null; }
+port_is_ours() {
+  api "${DOCKER}/containers/json?all=1" | jq -e --argjson p "$1" --arg s "$STACK_NAME" '
+    any(.[]; (.Labels["com.docker.compose.project"] // "") == $s and any(.Ports[]?; .PublicPort == $p))' >/dev/null
+}
+free_port_suggestions() {
+  local p found=()
+  for p in $(seq 31800 7 32690); do
+    port_answers "$p" || found+=("$p")
+    ((${#found[@]} >= 3)) && break
+  done
+  echo "${found[*]}"
+}
+port_taken_hint() {
+  echo "       Set the repository variable WEB_PORT (or WEB_PORT=... locally) to a free port;" >&2
+  echo "       ports that do not answer right now: $(free_port_suggestions)" >&2
 }
 
 ensure_volumes() {
@@ -226,10 +241,13 @@ cmd_deploy() {
     fi
   done
   check_reachable
-  local holder
-  holder=$(port_taken_by_others)
-  if [[ -n "$holder" ]]; then
-    echo "error: port ${WEB_PORT} is used by ${holder}; set WEB_PORT to another free port in 30000-32699" >&2
+  if ((WEB_PORT < 30000 || WEB_PORT > 32699)); then
+    echo "error: WEB_PORT ${WEB_PORT} is outside 30000-32699, the only ports the cluster allows" >&2
+    exit 1
+  fi
+  if port_answers "$WEB_PORT" && ! port_is_ours "$WEB_PORT"; then
+    echo "error: port ${WEB_PORT} is already used by something outside this stack." >&2
+    port_taken_hint
     exit 1
   fi
   ensure_volumes
@@ -242,12 +260,20 @@ cmd_deploy() {
     echo "error: stack ${STACK_NAME} (id ${stack_id}) is a Swarm stack (no GPU there); remove it in Portainer" >&2
     exit 1
   fi
-  if [[ -n "${stack_id:-}" ]]; then
-    echo "updating stack ${STACK_NAME} (id ${stack_id})"
+  update_stack() {
     jq -n --rawfile f "$STACK_FILE" --argjson env "$env_json" \
       '{stackFileContent: $f, env: $env, prune: true, pullImage: false}' |
       api -X PUT -H "Content-Type: application/json" --data @- \
         "${PORTAINER_URL}/api/stacks/${stack_id}?endpointId=${PORTAINER_ENDPOINT_ID}" >/dev/null
+  }
+  # How many deployment results Portainer has recorded so far: the wait below
+  # only trusts a result newer than this (a failed stack keeps its old error).
+  deployments() { api "${PORTAINER_URL}/api/stacks/${stack_id}" | jq '.DeploymentStatus // [] | length'; }
+  local before=0
+  if [[ -n "${stack_id:-}" ]]; then
+    echo "updating stack ${STACK_NAME} (id ${stack_id})"
+    before=$(deployments)
+    update_stack
   else
     echo "creating stack ${STACK_NAME}"
     stack_id=$(jq -n --arg n "$STACK_NAME" --rawfile f "$STACK_FILE" --argjson env "$env_json" \
@@ -258,15 +284,32 @@ cmd_deploy() {
   fi
 
   # Portainer deploys in the background: stack status 3 while busy, 1 when done.
-  local deadline=$((SECONDS + 600)) stack
+  # On an update d2k sometimes creates the new NodePort before releasing the
+  # old one ("provided port is already allocated", seen by Florensis and CEVA);
+  # retrying works, so that error is retried a few times when the port is ours.
+  local deadline=$((SECONDS + 600)) stack status count message port_tries=0 since=$SECONDS
   while :; do
     stack=$(api "${PORTAINER_URL}/api/stacks/${stack_id}")
-    case "$(jq -r .Status <<<"$stack")" in
-      1) break ;;
-      3) ;;
-      *) echo "error: Portainer could not deploy: $(jq -r '.DeploymentStatus[-1].Message // "no message"' <<<"$stack")" >&2
-         exit 1 ;;
-    esac
+    status=$(jq -r .Status <<<"$stack")
+    count=$(jq '.DeploymentStatus // [] | length' <<<"$stack")
+    message=$(jq -r '.DeploymentStatus[-1].Message // "no message"' <<<"$stack")
+    # If Portainer keeps no growing history, trust the status after a minute.
+    if [[ "$status" == "3" ]] || { ((count <= before)) && ((SECONDS - since < 60)); }; then
+      :  # still deploying, or no result for this deploy yet
+    elif [[ "$status" == "1" ]]; then
+      break
+    elif [[ "$message" == *"port is already allocated"* ]] && port_is_ours "$WEB_PORT" && ((port_tries < 3)); then
+      port_tries=$((port_tries + 1))
+      echo "our port is still held by the previous containers; updating again in 30s (${port_tries}/3)"
+      sleep 30
+      before=$count
+      since=$SECONDS
+      update_stack
+    else
+      echo "error: Portainer could not deploy: ${message}" >&2
+      [[ "$message" == *"port is already allocated"* ]] && port_taken_hint
+      exit 1
+    fi
     ((SECONDS < deadline)) || { echo "error: Portainer still deploying after 600s" >&2; exit 1; }
     sleep "$POLL_SECONDS"
   done
