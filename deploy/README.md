@@ -178,4 +178,5 @@ To restore, reverse it: serve the tar from a machine the cluster can reach,
 | pill says `CPU (slow)` | the card had < 5 GB free at startup: `stop`, then `start` later |
 | `is a Swarm stack` | someone created `ukt` in the UI: remove it in Portainer, deploy again |
 | api stays `starting` for a long time | the first model download; run `logs-api` |
+| "network error during upload" | the dashboard dropped the upload: check `ukt-web`'s restart count (memory) and logs. The proxy streams with backpressure (~110 MB for a 900 MB file) and allows 3 h per upload (`UPLOAD_TIMEOUT_S`) |
 | `execvpe(/bin/bash) failed` locally | that is WSL's bash: use `.\deploy\ukt.ps1` |

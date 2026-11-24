@@ -26,8 +26,9 @@ ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     PORT=8000 \
     HOSTNAME=0.0.0.0 \
-    NODE_OPTIONS=--max-old-space-size=256
+    NODE_OPTIONS="--max-old-space-size=256 --require ./server-timeouts.cjs"
 COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/server-timeouts.cjs ./
 COPY --from=build /app/.next/static ./.next/static
 COPY --from=build /app/public ./public
 USER node
