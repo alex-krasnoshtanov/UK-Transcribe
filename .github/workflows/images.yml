@@ -4,8 +4,8 @@ name: Images
 # smoke-tests them on the CPU, and pushes them to GHCR:
 #   ghcr.io/alex-krasnoshtanov/uk-transcribe:sha-<short>      (and :main)
 #   ghcr.io/alex-krasnoshtanov/uk-transcribe-web:sha-<short>  (and :main)
-# Deploying is a separate, manual step from a laptop on the university network:
-#   doppler run -- bash deploy/ukt.sh deploy        (deploy/README.md)
+# Then, with CLUSTER_DEPLOY=true, it deploys them to the student cluster through
+# the "Operate the cluster" workflow (cluster.yml), on the runner in the cluster.
 # Both packages must be Public once, or the cluster cannot pull them.
 
 on:
@@ -148,8 +148,23 @@ jobs:
             docker push "${image}:main"
           done
           echo "### Pushed \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Deploy: \`doppler run -- bash deploy/ukt.sh deploy ${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy: Actions -> Operate the cluster -> deploy \`${TAG}\` (automatic with CLUSTER_DEPLOY=true)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log out of GHCR
         if: always()
         run: docker logout ghcr.io || true
+
+  # CD: every build on main is deployed, once the runner in the cluster exists.
+  # Turn it on with the repository variable CLUSTER_DEPLOY=true (Settings ->
+  # Secrets and variables -> Actions -> Variables); without it this job is
+  # skipped, so CI never waits for a runner that is not there.
+  deploy:
+    name: Deploy to the cluster
+    needs: build
+    if: vars.CLUSTER_DEPLOY == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/cluster.yml
+    with:
+      action: deploy
+    secrets: inherit

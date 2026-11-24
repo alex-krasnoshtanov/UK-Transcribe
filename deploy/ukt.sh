@@ -7,10 +7,14 @@
 #   doppler run -- bash deploy/ukt.sh status                 containers, health, /healthz
 #   doppler run -- bash deploy/ukt.sh logs [ukt-api|ukt-web] [lines]
 #
-# Needs bash, curl and jq (Git Bash on Windows is fine) and the university
-# network (campus Wi-Fi or VPN): Portainer is not reachable from outside.
+# Normally run by GitHub Actions on the runner inside the cluster
+# (.github/workflows/cluster.yml, "Operate the cluster"). Locally it needs
+# bash, curl and jq (on Windows: deploy/ukt.ps1, which uses Git Bash) and the
+# university network (campus Wi-Fi or VPN).
 #
-# Environment (from Doppler project uk-transcribe, config prd; never printed):
+# Environment (from Doppler project uk-transcribe, config prd; never printed).
+# Either already set (doppler run), or DOPPLER_TOKEN, a read-only service token
+# for that config, from which the script reads them itself:
 #   PORTAINER_URL          https://194.171.191.226:3085 (no trailing slash)
 #   PORTAINER_TOKEN        Portainer access token (My account -> Access tokens)
 #   PORTAINER_ENDPOINT_ID  16, "Student apps (cluster)"
@@ -32,7 +36,7 @@ WEB_REPO="${OWNER}/uk-transcribe-web"
 SERVICES="ukt-api ukt-web"
 # name:size:uid:gid; the api runs as 10001 (Dockerfile, deploy/cluster.yml)
 VOLUMES="ukt-data:20Gi:10001:10001 ukt-models:10Gi:10001:10001"
-WEB_PORT="${WEB_PORT:-30500}"
+WEB_PORT="${WEB_PORT:-30500}"  # empty (an unset Actions variable) = 30500
 NODE_IP="${NODE_IP:-194.171.191.229}"
 WAIT_SECONDS="${WAIT_SECONDS:-1800}"
 POLL_SECONDS=10
@@ -43,12 +47,32 @@ usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 for tool in curl jq; do
   command -v "$tool" >/dev/null || { echo "error: $tool is not installed" >&2; exit 1; }
 done
-: "${PORTAINER_URL:?run through doppler: doppler run -- bash deploy/ukt.sh ...}"
-: "${PORTAINER_TOKEN:?missing in Doppler}" "${PORTAINER_ENDPOINT_ID:?missing in Doppler}"
-PORTAINER_URL="${PORTAINER_URL%/}"
-
 # jq on Windows ends lines with CRLF.
 jq() { command jq "$@" | tr -d '\r'; }
+
+# In GitHub Actions only a read-only Doppler service token (DOPPLER_TOKEN) is
+# stored; the Portainer values are read from Doppler here, straight into this
+# process. Locally, `doppler run --` has already put them in the environment.
+if [[ -z "${PORTAINER_TOKEN:-}" && -n "${DOPPLER_TOKEN:-}" ]]; then
+  doppler_json=$(curl --silent --show-error --fail --max-time 60 \
+    -H "Authorization: Bearer ${DOPPLER_TOKEN}" \
+    "https://api.doppler.com/v3/configs/config/secrets/download?format=json") || {
+    echo "error: Doppler refused DOPPLER_TOKEN or is unreachable" >&2
+    exit 1
+  }
+  for name in PORTAINER_URL PORTAINER_TOKEN PORTAINER_ENDPOINT_ID PORTAINER_INSECURE; do
+    value=$(jq -r --arg n "$name" '.[$n] // empty' <<<"$doppler_json")
+    [[ -n "$value" && -z "${!name:-}" ]] && export "$name=$value"
+  done
+  unset doppler_json value
+fi
+# Keep the token out of GitHub's logs even if a tool echoes it.
+[[ -n "${GITHUB_ACTIONS:-}" && -n "${PORTAINER_TOKEN:-}" ]] && echo "::add-mask::${PORTAINER_TOKEN}"
+
+: "${PORTAINER_URL:?not set: run through doppler (doppler run -- ...) or set DOPPLER_TOKEN}"
+: "${PORTAINER_TOKEN:?missing in Doppler}" "${PORTAINER_ENDPOINT_ID:?missing in Doppler}"
+PORTAINER_URL="${PORTAINER_URL%/}"
+summary() { [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] && printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; return 0; }
 curl_opts=(--silent --show-error -H "X-API-Key: ${PORTAINER_TOKEN}")
 [[ "${PORTAINER_INSECURE:-0}" == "1" ]] && curl_opts+=(--insecure)
 api() { curl "${curl_opts[@]}" --max-time 600 --fail-with-body "$@"; }
@@ -186,7 +210,9 @@ healthz() {
 
 cmd_deploy() {
   local tag="${1:-}"
-  if [[ -z "$tag" ]]; then
+  if [[ -z "$tag" && -n "${GITHUB_SHA:-}" ]]; then
+    tag="sha-${GITHUB_SHA::7}"  # in Actions: the commit the workflow runs on
+  elif [[ -z "$tag" ]]; then
     git -C "$(dirname "$0")" fetch -q origin main 2>/dev/null || true
     tag="sha-$(git -C "$(dirname "$0")" rev-parse --short=7 origin/main)"
   fi
@@ -246,6 +272,7 @@ cmd_deploy() {
   done
   wait_healthy "$tag"
   echo "deployed ${tag}: http://${NODE_IP}:${WEB_PORT}"
+  summary "### Deployed \`${tag}\`" "" "Dashboard: http://${NODE_IP}:${WEB_PORT}"
   healthz
 }
 
@@ -257,6 +284,7 @@ cmd_stop() {
   if [[ "$st" == "2" ]]; then echo "already stopped"; return 0; fi
   if api -X POST "${PORTAINER_URL}/api/stacks/${stack_id}/stop?endpointId=${PORTAINER_ENDPOINT_ID}" >/dev/null 2>&1; then
     echo "stack ${STACK_NAME} stopped: the GPU slice is released, the volumes keep all data"
+    summary "### Stopped: GPU slice released, data kept"
     return 0
   fi
   # Fallback: stop the containers one by one.
@@ -282,6 +310,7 @@ cmd_start() {
   fi
   wait_healthy
   echo "running: http://${NODE_IP}:${WEB_PORT}"
+  summary "### Started" "" "Dashboard: http://${NODE_IP}:${WEB_PORT}"
   healthz
 }
 

@@ -1,0 +1,39 @@
+# The self-hosted GitHub runner that operates the ukt stack: stack "ukt-runner"
+# in the BUas Portainer environment "Student apps (cluster)".
+#
+# Why: Portainer is only reachable from the university network, so GitHub's own
+# runners cannot call it. This runner lives inside the cluster and only
+# connects out (to GitHub for jobs, to Portainer and Doppler for the deploy);
+# nothing connects in, no ports. It builds nothing and has no Docker socket:
+# GitHub builds the images, this only runs deploy/ukt.sh (bash, curl, jq).
+#
+# SET UP ONCE (deploy/README.md, "CD from GitHub"):
+#   1. A PAT that can register runners on alex-krasnoshtanov/UK-Transcribe:
+#      fine-grained with "Administration: read and write" on that repo, or a
+#      classic PAT with the repo scope.
+#   2. Portainer -> Student apps (cluster) -> Stacks -> Add stack "ukt-runner"
+#      -> Web editor -> paste this file. (The UI makes a Swarm stack; for the
+#      runner that is fine: it needs no GPU and no health check.)
+#   3. Environment variable GH_RUNNER_PAT = <the PAT>. Deploy the stack.
+#   4. GitHub -> Settings -> Actions -> Runners lists "uni-apps-ukt" as Idle.
+
+services:
+  ukt-runner:
+    # latest, so the runner binary always meets GitHub's minimum version; a
+    # pinned one gets rejected by GitHub after a while and crash-loops.
+    image: myoung34/github-runner:latest
+    environment:
+      RUNNER_SCOPE: repo
+      REPO_URL: https://github.com/alex-krasnoshtanov/UK-Transcribe
+      ACCESS_TOKEN: ${GH_RUNNER_PAT}
+      RUNNER_NAME: uni-apps-ukt
+      RUNNER_WORKDIR: /tmp/runner/work
+      # Its own label, so only this repo's cluster jobs land on it.
+      LABELS: self-hosted,uni-apps-ukt
+    # The cluster needs always or unless-stopped (no bare pods).
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512m

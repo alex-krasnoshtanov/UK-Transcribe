@@ -12,8 +12,9 @@ and no audio leaving the machine. Built on
 - **API** (FastAPI, `app/`): one GPU worker, a durable SQLite queue that
   survives restarts, and timestamped segments stored as they are decoded.
 - **Deploy** (`deploy/`): the university "Student apps (cluster)" with a
-  **GPU memory slice** (not a whole card), and a script to deploy, stop and
-  start it with the Portainer key kept in Doppler. See
+  **GPU memory slice** (not a whole card). Every push to `main` builds and
+  deploys; Actions, then "Operate the cluster", stops, starts and shows the
+  status. The Portainer key stays in Doppler. See
   [deploy/README.md](deploy/README.md).
 
 Language is always forced to `uk`, because Whisper's auto-detect confuses
@@ -33,6 +34,8 @@ web/                 Next.js dashboard; talks to the API via /api/backend
 main.py              CLI over the same engine (debug)
 deploy/cluster.yml   compose stack for the student cluster
 deploy/ukt.sh        deploy / stop / start / status / logs through the Portainer API
+deploy/ukt.ps1       the same from PowerShell (Git Bash + doppler run)
+deploy/runner.yml    the self-hosted runner inside the cluster that runs it in CI
 docker-compose.yml   local or desktop run (whole GPU, builds both images)
 tests/               API tests (no GPU needed) + cluster compose rules
 ```
@@ -71,8 +74,10 @@ cd web && npm test && npm run lint && npm run typecheck && npm run build
 ```
 
 CI (`.github/workflows/images.yml`) runs the tests on every push. On `main` it
-also builds both images, smoke-tests them on the CPU, and pushes
-`ghcr.io/alex-krasnoshtanov/uk-transcribe[-web]:sha-<short>`.
+also builds both images, smoke-tests them on the CPU, pushes
+`ghcr.io/alex-krasnoshtanov/uk-transcribe[-web]:sha-<short>`, and deploys them
+to the cluster (`.github/workflows/cluster.yml`, which you can also run by
+hand for deploy, stop, start, status and logs).
 
 ## Environment variables (API)
 

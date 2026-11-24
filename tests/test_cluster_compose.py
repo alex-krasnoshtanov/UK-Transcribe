@@ -97,3 +97,21 @@ def test_deploy_script_knows_the_services_and_volumes():
         assert volume["name"] in script, volume["name"]
     uid = SERVICES["ukt-api"]["user"].split(":")[0]
     assert uid in script  # the volumes are handed to the api's user
+
+
+def test_ci_runs_cluster_jobs_on_our_runner_only():
+    runner = yaml.safe_load((ROOT / "deploy/runner.yml").read_text(encoding="utf-8"))
+    (name, service), = runner["services"].items()
+    assert name.startswith("ukt-")
+    labels = set(service["environment"]["LABELS"].split(","))
+    assert service["deploy"]["resources"]["limits"] == {"cpus": "1", "memory": "512m"}
+    assert "ports" not in service
+    cluster = yaml.safe_load((ROOT / ".github/workflows/cluster.yml").read_text(encoding="utf-8"))
+    (job,) = cluster["jobs"].values()
+    assert set(job["runs-on"]) <= labels and "uni-apps-ukt" in job["runs-on"]
+    images = yaml.safe_load((ROOT / ".github/workflows/images.yml").read_text(encoding="utf-8"))
+    deploy = images["jobs"]["deploy"]
+    assert deploy["uses"] == "./.github/workflows/cluster.yml"
+    assert deploy["if"] == "vars.CLUSTER_DEPLOY == 'true'"  # never waits for a missing runner
+    # Pull requests never reach the runner or the secrets.
+    assert images["jobs"]["build"]["if"].startswith("github.event_name != 'pull_request'")

@@ -1,0 +1,76 @@
+name: Operate the cluster
+
+# Deploy, stop, start or inspect the ukt stack on the BUas "Student apps
+# (cluster)" from GitHub: Actions -> "Operate the cluster" -> Run workflow.
+# Also called by the Images workflow after every build on main (auto-deploy).
+#
+# Runs on the self-hosted runner inside the cluster (deploy/runner.yml),
+# because Portainer is only reachable from the university network. The only
+# stored secret is DOPPLER_TOKEN (repository secret), a read-only Doppler service token for
+# uk-transcribe/prd; deploy/ukt.sh reads the Portainer values from it.
+# Setup: deploy/README.md, "CD from GitHub".
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to do
+        type: choice
+        options: [status, deploy, stop, start, logs-api, logs-web]
+        default: status
+      tag:
+        description: "Image tag to deploy (sha-<short>); empty = this commit"
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      action:
+        type: string
+        required: true
+      tag:
+        type: string
+        required: false
+
+# One cluster operation at a time; never cancel one halfway through.
+concurrency:
+  group: ukt-cluster
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  operate:
+    name: ${{ inputs.action }}
+    runs-on: [self-hosted, uni-apps-ukt]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the tools ukt.sh needs
+        run: |
+          missing=()
+          for tool in curl jq; do command -v "$tool" >/dev/null || missing+=("$tool"); done
+          if ((${#missing[@]})); then
+            sudo=$(command -v sudo || true)
+            $sudo apt-get update -qq
+            $sudo apt-get install -y -qq "${missing[@]}"
+          fi
+
+      - name: Run deploy/ukt.sh ${{ inputs.action }}
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+          ACTION: ${{ inputs.action }}
+          TAG: ${{ inputs.tag }}
+          WEB_PORT: ${{ vars.WEB_PORT }}
+        run: |
+          case "$ACTION" in
+            deploy) bash deploy/ukt.sh deploy ${TAG:+"$TAG"} ;;
+            stop|start|status) bash deploy/ukt.sh "$ACTION" ;;
+            logs-api) bash deploy/ukt.sh logs ukt-api 300 ;;
+            logs-web) bash deploy/ukt.sh logs ukt-web 300 ;;
+            *) echo "::error::unknown action $ACTION"; exit 1 ;;
+          esac
