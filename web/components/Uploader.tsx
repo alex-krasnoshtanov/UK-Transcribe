@@ -15,6 +15,10 @@ type Item = {
   abort?: () => void;
 };
 
+// The dashboard is served over plain HTTP on a campus IP, which browsers don't
+// treat as a secure context, so crypto.randomUUID() doesn't exist there.
+let counter = 0;
+
 const ACCEPT = ".aac,.flac,.m4a,.mka,.mkv,.mov,.mp3,.mp4,.oga,.ogg,.opus,.wav,.webm,.wma,audio/*,video/*";
 
 /** Drag-and-drop or pick several files; they upload one after another. */
@@ -53,7 +57,7 @@ export function Uploader({ onQueued }: { onQueued: (job: Job) => void }) {
   function add(files: FileList | null) {
     if (!files?.length) return;
     const fresh = Array.from(files).map((file) => ({
-      key: `${file.name}-${file.size}-${crypto.randomUUID()}`,
+      key: `${file.name}-${file.size}-${++counter}`,
       file,
       progress: 0,
       state: "waiting" as const,

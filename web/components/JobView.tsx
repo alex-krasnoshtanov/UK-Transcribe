@@ -83,7 +83,22 @@ export function JobView({ id }: { id: string }) {
   }
 
   async function copyAll() {
-    await navigator.clipboard.writeText(segments.map((s) => s.text).join("\n"));
+    const text = segments.map((s) => s.text).join("\n");
+    // navigator.clipboard only exists in secure contexts (HTTPS or localhost);
+    // the cluster serves plain HTTP, so fall back to a hidden textarea.
+    if (navigator.clipboard) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   }
